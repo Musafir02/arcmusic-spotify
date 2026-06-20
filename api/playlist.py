@@ -1,22 +1,30 @@
 from http.server import BaseHTTPRequestHandler
 import json
 import urllib.parse
+import re
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
-        url = params.get("url", [None])[0]
+        raw_url = params.get("url", [None])[0]
 
-        if not url:
+        if not raw_url:
             self._json_response(400, {"error": "Missing 'url' parameter"})
+            return
+
+        playlist_id = self._extract_id(raw_url)
+        if not playlist_id:
+            self._json_response(400, {"error": "Could not extract playlist ID from URL"})
             return
 
         try:
             from spotify_scraper import SpotifyClient
 
+            clean_url = f"https://open.spotify.com/playlist/{playlist_id}"
+
             with SpotifyClient() as client:
-                playlist = client.get_playlist(url)
+                playlist = client.get_playlist(clean_url)
 
                 tracks = []
                 for entry in playlist.tracks:
@@ -38,6 +46,10 @@ class handler(BaseHTTPRequestHandler):
 
         except Exception as e:
             self._json_response(500, {"error": str(e)})
+
+    def _extract_id(self, url):
+        match = re.search(r'playlist[/:]([a-zA-Z0-9]+)', url)
+        return match.group(1) if match else None
 
     def _json_response(self, status, data):
         self.send_response(status)
