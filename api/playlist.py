@@ -28,19 +28,23 @@ class handler(BaseHTTPRequestHandler):
 
                 tracks = []
                 for entry in playlist.tracks:
-                    track = entry.track
-                    artists = [a.name for a in track.artists] if track.artists else []
+                    t = entry.track
+                    artists = [a.name for a in t.artists] if t.artists else []
                     tracks.append({
-                        "name": track.name,
+                        "name": t.name,
                         "artists": artists,
-                        "duration_ms": track.duration_ms,
-                        "album": track.album.name if track.album else None,
+                        "duration_ms": t.duration_ms,
+                        "album": t.album.name if t.album else None,
                     })
+
+                owner_name = ""
+                if playlist.owner:
+                    owner_name = playlist.owner.get("name", "") if isinstance(playlist.owner, dict) else str(playlist.owner)
 
                 self._json_response(200, {
                     "name": playlist.name,
-                    "owner": playlist.subtitle or "",
-                    "track_count": playlist.track_count or len(tracks),
+                    "owner": owner_name,
+                    "track_count": playlist.total_tracks or len(tracks),
                     "tracks": tracks,
                 })
 
