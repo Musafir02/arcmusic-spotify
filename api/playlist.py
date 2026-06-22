@@ -1,13 +1,16 @@
 from http.server import BaseHTTPRequestHandler
-from spotify_scraper import SpotifyClient
 import json
 import urllib.parse
+import urllib.request
 import re
 import time
 
 _rate_limit_store = {}
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 10
+
+EMBED_URL = "https://open.spotify.com/embed/playlist/{}"
+PLAYLIST_API = "https://api-partner.spotify.com/pathfinder/v1/query"
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -37,35 +40,147 @@ class handler(BaseHTTPRequestHandler):
             return
 
         try:
-            clean_url = f"https://open.spotify.com/playlist/{playlist_id}"
+            tracks = []
+            playlist_name = ""
+            owner_name = ""
 
-            with SpotifyClient() as client:
-                playlist = client.get_playlist(clean_url)
+            try:
+                from spotify_scraper import SpotifyClient
+                with SpotifyClient() as client:
+                    clean_url = f"https://open.spotify.com/playlist/{playlist_id}"
+                    playlist = client.get_playlist(clean_url)
 
-                tracks = []
-                for entry in playlist.tracks:
-                    t = entry.track
-                    artists = [a.name for a in t.artists] if t.artists else []
-                    tracks.append({
-                        "name": t.name,
-                        "artists": artists,
-                        "duration_ms": t.duration_ms,
-                        "album": t.album.name if t.album else None,
-                    })
+                    for entry in playlist.tracks:
+                        t = entry.track
+                        artists = [a.name for a in t.artists] if t.artists else []
+                        tracks.append({
+                            "name": t.name,
+                            "artists": artists,
+                            "duration_ms": t.duration_ms,
+                            "album": t.album.name if t.album else None,
+                        })
 
-                owner_name = ""
-                if playlist.owner:
-                    owner_name = playlist.owner.get("name", "") if isinstance(playlist.owner, dict) else str(playlist.owner)
+                    playlist_name = playlist.name or ""
+                    if playlist.owner:
+                        owner_name = playlist.owner.get("name", "") if isinstance(playlist.owner, dict) else str(playlist.owner)
 
-                self._json_response(200, {
-                    "name": playlist.name,
-                    "owner": owner_name,
-                    "track_count": len(tracks),
-                    "tracks": tracks,
-                })
+                    total_reported = playlist.total_tracks or len(tracks)
+
+                    if total_reported > len(tracks):
+                        extra = self._fetch_remaining_via_embed(playlist_id, len(tracks))
+                        if extra:
+                            tracks.extend(extra)
+
+            except Exception as scraper_err:
+                embed_result = self._fetch_via_embed(playlist_id)
+                if embed_result:
+                    playlist_name = embed_result.get("name", "")
+                    tracks = embed_result.get("tracks", [])
+                else:
+                    raise scraper_err
+
+            self._json_response(200, {
+                "name": playlist_name,
+                "owner": owner_name,
+                "track_count": len(tracks),
+                "tracks": tracks,
+            })
 
         except Exception as e:
             self._json_response(500, {"error": str(e)})
+
+    def _fetch_via_embed(self, playlist_id):
+        try:
+            embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+            req = urllib.request.Request(embed_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8")
+
+            token_match = re.search(r'"accessToken":"([^"]+)"', html)
+            if not token_match:
+                return None
+
+            access_token = token_match.group(1)
+            return self._fetch_all_tracks_api(playlist_id, access_token)
+        except Exception:
+            return None
+
+    def _fetch_remaining_via_embed(self, playlist_id, already_have):
+        try:
+            embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+            req = urllib.request.Request(embed_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8")
+
+            token_match = re.search(r'"accessToken":"([^"]+)"', html)
+            if not token_match:
+                return []
+
+            access_token = token_match.group(1)
+            result = self._fetch_all_tracks_api(playlist_id, access_token)
+            if result and len(result.get("tracks", [])) > already_have:
+                return result["tracks"][already_have:]
+            return []
+        except Exception:
+            return []
+
+    def _fetch_all_tracks_api(self, playlist_id, access_token):
+        tracks = []
+        playlist_name = ""
+        offset = 0
+        limit = 100
+
+        while True:
+            api_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?offset={offset}&limit={limit}&fields=items(track(name,artists(name),duration_ms,album(name))),total,next"
+            req = urllib.request.Request(api_url, headers={
+                "Authorization": f"Bearer {access_token}",
+                "User-Agent": "Mozilla/5.0"
+            })
+
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except Exception:
+                break
+
+            items = data.get("items", [])
+            if not items:
+                break
+
+            for item in items:
+                t = item.get("track")
+                if not t or not t.get("name"):
+                    continue
+                artists = [a["name"] for a in t.get("artists", []) if a.get("name")]
+                tracks.append({
+                    "name": t["name"],
+                    "artists": artists,
+                    "duration_ms": t.get("duration_ms"),
+                    "album": t.get("album", {}).get("name") if t.get("album") else None,
+                })
+
+            offset += limit
+            if not data.get("next"):
+                break
+
+        if offset == 0:
+            try:
+                meta_url = f"https://api.spotify.com/v1/playlists/{playlist_id}?fields=name"
+                req = urllib.request.Request(meta_url, headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "User-Agent": "Mozilla/5.0"
+                })
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    meta = json.loads(resp.read().decode("utf-8"))
+                    playlist_name = meta.get("name", "")
+            except Exception:
+                pass
+
+        return {"name": playlist_name, "tracks": tracks}
 
     def _extract_id(self, url):
         match = re.search(r'playlist[/:]([a-zA-Z0-9_-]+)', url)
