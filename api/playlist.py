@@ -53,6 +53,7 @@ class handler(BaseHTTPRequestHandler):
             self._json_response(500, {"error": str(e)})
 
     def _fetch_playlist(self, playlist_id):
+        debug = []
         embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
         req = urllib.request.Request(embed_url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -71,6 +72,7 @@ class handler(BaseHTTPRequestHandler):
         playlist_name = ""
         owner = ""
         total_tracks = 0
+        debug.append(f"embed_tracks_from_html: {len(tracks)}")
 
         if next_data_match:
             try:
@@ -105,11 +107,13 @@ class handler(BaseHTTPRequestHandler):
                     if not playlist_name:
                         playlist_name = meta.get("name", "")
                     total_tracks = meta.get("tracks", {}).get("total", 0)
+                    debug.append(f"api_total_tracks: {total_tracks}")
                     o = meta.get("owner", {})
                     if o and not owner:
                         owner = o.get("display_name", "")
-            except Exception:
+            except Exception as e:
                 total_tracks = len(tracks)
+                debug.append(f"meta_error: {str(e)}")
 
             if total_tracks > len(tracks):
                 offset = len(tracks)
@@ -143,13 +147,14 @@ class handler(BaseHTTPRequestHandler):
                         offset += limit
                         if not data.get("next"):
                             break
-                    except Exception:
+                    except Exception as e:
+                        debug.append(f"page_error_at_{offset}: {str(e)}")
                         break
 
         if not tracks:
             return self._fallback_scraper(playlist_id)
 
-        return {"name": playlist_name, "owner": owner, "tracks": tracks}
+        return {"name": playlist_name, "owner": owner, "tracks": tracks, "_debug": debug}
 
     def _fallback_scraper(self, playlist_id):
         try:
