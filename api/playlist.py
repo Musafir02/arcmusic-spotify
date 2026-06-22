@@ -6,12 +6,14 @@ import urllib.error
 import re
 import time
 
-GRAPHQL_HASH = "a65e12194ed5fc443a1cdebed5fabe33ca5b07b987185d63c72483867ad13cb4"
 PARTNER_API = "https://api-partner.spotify.com/pathfinder/v1/query"
+FALLBACK_HASH = "a65e12194ed5fc443a1cdebed5fabe33ca5b07b987185d63c72483867ad13cb4"
 
+_hash_cache = {"hash": FALLBACK_HASH, "expires": 0}
 _rate_limit_store = {}
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 10
+HASH_CACHE_TTL = 86400
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -46,6 +48,11 @@ class handler(BaseHTTPRequestHandler):
                 self._json_response(500, {"error": "Could not obtain access token"})
                 return
 
+            graphql_hash = self._get_graphql_hash()
+            if not graphql_hash:
+                self._json_response(500, {"error": "Could not resolve GraphQL hash"})
+                return
+
             access_token = embed_data["token"]
             playlist_name = embed_data.get("name", "")
             owner = embed_data.get("owner", "")
@@ -56,7 +63,15 @@ class handler(BaseHTTPRequestHandler):
             total = None
 
             while True:
-                result = self._graphql_fetch(playlist_id, access_token, offset, limit)
+                result = self._graphql_fetch(playlist_id, access_token, graphql_hash, offset, limit)
+
+                if result is None:
+                    _hash_cache["hash"] = None
+                    _hash_cache["expires"] = 0
+                    graphql_hash = self._get_graphql_hash()
+                    if graphql_hash:
+                        result = self._graphql_fetch(playlist_id, access_token, graphql_hash, offset, limit)
+
                 if not result:
                     break
 
@@ -105,6 +120,41 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json_response(500, {"error": str(e)})
 
+    def _get_graphql_hash(self):
+        now = time.time()
+        if _hash_cache["hash"] and _hash_cache["expires"] > now:
+            return _hash_cache["hash"]
+
+        try:
+            page_req = urllib.request.Request("https://open.spotify.com", headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            })
+            with urllib.request.urlopen(page_req, timeout=10) as resp:
+                page_html = resp.read().decode("utf-8")
+
+            js_match = re.search(r'(https://open\.spotifycdn\.com/cdn/build/web-player/web-player\.[a-f0-9]+\.js)', page_html)
+            if not js_match:
+                return _hash_cache["hash"] or FALLBACK_HASH
+
+            js_url = js_match.group(1)
+            js_req = urllib.request.Request(js_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(js_req, timeout=45) as resp:
+                js_content = resp.read().decode("utf-8")
+
+            hash_match = re.search(r'"fetchPlaylistContents","query","([a-f0-9]{64})"', js_content)
+            if not hash_match:
+                hash_match = re.search(r'fetchPlaylist\w*","query","([a-f0-9]{64})"', js_content)
+
+            if hash_match:
+                _hash_cache["hash"] = hash_match.group(1)
+                _hash_cache["expires"] = now + HASH_CACHE_TTL
+                return _hash_cache["hash"]
+
+        except Exception:
+            pass
+
+        return _hash_cache["hash"] or FALLBACK_HASH
+
     def _get_embed_data(self, playlist_id):
         embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
         req = urllib.request.Request(embed_url, headers={
@@ -134,7 +184,7 @@ class handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _graphql_fetch(self, playlist_id, token, offset=0, limit=400):
+    def _graphql_fetch(self, playlist_id, token, graphql_hash, offset=0, limit=400):
         variables = json.dumps({
             "uri": f"spotify:playlist:{playlist_id}",
             "offset": offset,
@@ -143,7 +193,7 @@ class handler(BaseHTTPRequestHandler):
         extensions = json.dumps({
             "persistedQuery": {
                 "version": 1,
-                "sha256Hash": GRAPHQL_HASH,
+                "sha256Hash": graphql_hash,
             }
         })
 
@@ -166,6 +216,9 @@ class handler(BaseHTTPRequestHandler):
                 data = json.loads(resp.read().decode("utf-8"))
 
             if "errors" in data:
+                for err in data["errors"]:
+                    if "PersistedQueryNotFound" in err.get("message", ""):
+                        return None
                 return None
 
             return data.get("data", {}).get("playlistV2", {}).get("content", {})
