@@ -73,7 +73,9 @@ class handler(BaseHTTPRequestHandler):
         playlist_name = ""
         owner = ""
         total_tracks = 0
-        debug.append(f"embed_tracks_from_html: {len(tracks)}")
+
+        debug.append(f"token_found: {bool(token_match)}")
+        debug.append(f"next_data_found: {bool(next_data_match)}")
 
         if next_data_match:
             try:
@@ -82,7 +84,10 @@ class handler(BaseHTTPRequestHandler):
                 playlist_name = entity.get("name", "")
                 owner = entity.get("subtitle", "")
 
-                for t in entity.get("trackList", []):
+                track_list = entity.get("trackList", [])
+                debug.append(f"trackList_len: {len(track_list)}")
+
+                for t in track_list:
                     artists_raw = t.get("subtitle", "")
                     artists = [a.strip() for a in artists_raw.replace("\u00b7", ",").split(",")] if artists_raw else []
                     tracks.append({
@@ -91,8 +96,10 @@ class handler(BaseHTTPRequestHandler):
                         "duration_ms": t.get("duration"),
                         "album": None,
                     })
-            except Exception:
-                pass
+            except Exception as e:
+                debug.append(f"parse_error: {str(e)}")
+
+        debug.append(f"embed_tracks_parsed: {len(tracks)}")
 
         if token_match:
             access_token = token_match.group(1)
