@@ -60,7 +60,7 @@ class handler(BaseHTTPRequestHandler):
                 self._json_response(200, {
                     "name": playlist.name,
                     "owner": owner_name,
-                    "track_count": playlist.total_tracks or len(tracks),
+                    "track_count": len(tracks),
                     "tracks": tracks,
                 })
 
