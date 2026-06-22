@@ -2,6 +2,7 @@ from http.server import BaseHTTPRequestHandler
 import json
 import urllib.parse
 import urllib.request
+import urllib.error
 import re
 import time
 
@@ -43,153 +44,110 @@ class handler(BaseHTTPRequestHandler):
                 return
 
             self._json_response(200, {
-                "name": result.get("name", ""),
-                "owner": result.get("owner", ""),
+                "name": result["name"],
+                "owner": result["owner"],
                 "track_count": len(result["tracks"]),
                 "tracks": result["tracks"],
-                "_debug": result.get("_debug", []),
             })
 
         except Exception as e:
             self._json_response(500, {"error": str(e)})
 
     def _fetch_playlist(self, playlist_id):
-        debug = []
         embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
         req = urllib.request.Request(embed_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         })
 
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8")
-        except Exception:
-            return self._fallback_scraper(playlist_id)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8")
 
         token_match = re.search(r'"accessToken":"([^"]+)"', html)
-        next_data_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if not token_match:
+            return None
+
+        access_token = token_match.group(1)
 
         tracks = []
         playlist_name = ""
         owner = ""
-        total_tracks = 0
 
-        debug.append(f"token_found: {bool(token_match)}")
-        debug.append(f"next_data_found: {bool(next_data_match)}")
-
-        if next_data_match:
+        nd_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if nd_match:
             try:
-                nd = json.loads(next_data_match.group(1))
+                nd = json.loads(nd_match.group(1))
                 entity = nd.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
                 playlist_name = entity.get("name", "")
                 owner = entity.get("subtitle", "")
 
-                track_list = entity.get("trackList", [])
-                debug.append(f"trackList_len: {len(track_list)}")
-
-                for t in track_list:
-                    artists_raw = t.get("subtitle", "")
-                    artists = [a.strip() for a in artists_raw.replace("\u00b7", ",").split(",")] if artists_raw else []
+                for t in entity.get("trackList", []):
+                    sub = t.get("subtitle", "")
+                    artists = [a.strip() for a in sub.replace("\u00b7", ",").split(",")] if sub else []
                     tracks.append({
                         "name": t.get("title", ""),
                         "artists": artists,
                         "duration_ms": t.get("duration"),
                         "album": None,
                     })
-            except Exception as e:
-                debug.append(f"parse_error: {str(e)}")
-
-        debug.append(f"embed_tracks_parsed: {len(tracks)}")
-
-        if token_match:
-            access_token = token_match.group(1)
-
-            try:
-                meta_url = f"https://api.spotify.com/v1/playlists/{playlist_id}?fields=name,owner(display_name),tracks(total)"
-                meta_req = urllib.request.Request(meta_url, headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "User-Agent": "Mozilla/5.0"
-                })
-                with urllib.request.urlopen(meta_req, timeout=10) as resp:
-                    meta = json.loads(resp.read().decode("utf-8"))
-                    if not playlist_name:
-                        playlist_name = meta.get("name", "")
-                    total_tracks = meta.get("tracks", {}).get("total", 0)
-                    debug.append(f"api_total_tracks: {total_tracks}")
-                    o = meta.get("owner", {})
-                    if o and not owner:
-                        owner = o.get("display_name", "")
-            except Exception as e:
-                total_tracks = len(tracks)
-                debug.append(f"meta_error: {str(e)}")
-
-            if total_tracks > len(tracks):
-                offset = len(tracks)
-                limit = 100
-                while offset < total_tracks:
-                    try:
-                        api_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?offset={offset}&limit={limit}"
-                        api_req = urllib.request.Request(api_url, headers={
-                            "Authorization": f"Bearer {access_token}",
-                            "User-Agent": "Mozilla/5.0"
-                        })
-                        with urllib.request.urlopen(api_req, timeout=15) as resp:
-                            data = json.loads(resp.read().decode("utf-8"))
-
-                        items = data.get("items", [])
-                        if not items:
-                            break
-
-                        for item in items:
-                            t = item.get("track")
-                            if not t or not t.get("name"):
-                                continue
-                            artists = [a["name"] for a in t.get("artists", []) if a.get("name")]
-                            tracks.append({
-                                "name": t["name"],
-                                "artists": artists,
-                                "duration_ms": t.get("duration_ms"),
-                                "album": t.get("album", {}).get("name") if t.get("album") else None,
-                            })
-
-                        offset += limit
-                        if not data.get("next"):
-                            break
-                    except Exception as e:
-                        debug.append(f"page_error_at_{offset}: {str(e)}")
-                        break
+            except Exception:
+                pass
 
         if not tracks:
-            return self._fallback_scraper(playlist_id)
-
-        return {"name": playlist_name, "owner": owner, "tracks": tracks, "_debug": debug}
-
-    def _fallback_scraper(self, playlist_id):
-        try:
-            from spotify_scraper import SpotifyClient
-            with SpotifyClient() as client:
-                clean_url = f"https://open.spotify.com/playlist/{playlist_id}"
-                playlist = client.get_playlist(clean_url)
-
-                tracks = []
-                for entry in playlist.tracks:
-                    t = entry.track
-                    artists = [a.name for a in t.artists] if t.artists else []
-                    tracks.append({
-                        "name": t.name,
-                        "artists": artists,
-                        "duration_ms": t.duration_ms,
-                        "album": t.album.name if t.album else None,
-                    })
-
-                playlist_name = playlist.name or ""
-                owner_name = ""
-                if playlist.owner:
-                    owner_name = playlist.owner.get("name", "") if isinstance(playlist.owner, dict) else str(playlist.owner)
-
-                return {"name": playlist_name, "owner": owner_name, "tracks": tracks}
-        except Exception:
             return None
+
+        offset = len(tracks)
+        limit = 100
+        max_retries = 2
+
+        while True:
+            page_data = self._api_get_with_retry(
+                f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?offset={offset}&limit={limit}",
+                access_token,
+                max_retries,
+            )
+            if not page_data:
+                break
+
+            items = page_data.get("items", [])
+            if not items:
+                break
+
+            for item in items:
+                t = item.get("track")
+                if not t or not t.get("name"):
+                    continue
+                artists = [a["name"] for a in t.get("artists", []) if a.get("name")]
+                tracks.append({
+                    "name": t["name"],
+                    "artists": artists,
+                    "duration_ms": t.get("duration_ms"),
+                    "album": t.get("album", {}).get("name") if t.get("album") else None,
+                })
+
+            offset += limit
+            if not page_data.get("next"):
+                break
+
+        return {"name": playlist_name, "owner": owner, "tracks": tracks}
+
+    def _api_get_with_retry(self, url, token, max_retries=2):
+        for attempt in range(max_retries + 1):
+            req = urllib.request.Request(url, headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Mozilla/5.0",
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < max_retries:
+                    retry_after = int(e.headers.get("Retry-After", "2"))
+                    time.sleep(min(retry_after, 4))
+                    continue
+                return None
+            except Exception:
+                return None
+        return None
 
     def _extract_id(self, url):
         match = re.search(r'playlist[/:]([a-zA-Z0-9_-]+)', url)
@@ -214,7 +172,7 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
