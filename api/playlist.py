@@ -5,6 +5,7 @@ import urllib.request
 import urllib.error
 import re
 import time
+import concurrent.futures
 
 PARTNER_API = "https://api-partner.spotify.com/pathfinder/v1/query"
 FALLBACK_HASH = "a65e12194ed5fc443a1cdebed5fabe33ca5b07b987185d63c72483867ad13cb4"
@@ -12,8 +13,181 @@ FALLBACK_HASH = "a65e12194ed5fc443a1cdebed5fabe33ca5b07b987185d63c72483867ad13cb
 _hash_cache = {"hash": FALLBACK_HASH, "expires": 0}
 _rate_limit_store = {}
 RATE_LIMIT_WINDOW = 60
-RATE_LIMIT_MAX = 10
+RATE_LIMIT_MAX = 15
 HASH_CACHE_TTL = 86400
+
+# Regex patterns for cleaning titles
+CLEAN_REGEX = re.compile(
+    r'\s*(\(from\s+[^)]+\)|-\s*(slowed|reverb|lofi|lo-fi|remix|unplugged|reprise|acoustic|male|female|version|cover|remastered|extended|edit|feat\.?.*|ft\.?.*)$|\((slowed|reverb|lofi|lo-fi|remix|unplugged|reprise|acoustic|male|female|version|cover|remastered|extended|edit)[^)]*\)|\(feat\.?[^)]*\))',
+    re.IGNORECASE
+)
+NON_WORD_CHAR_REGEX = re.compile(r'[^\w\s]')
+WHITESPACE_REGEX = re.compile(r'\s+')
+
+def _clean_title(title):
+    if not title:
+        return ""
+    t = CLEAN_REGEX.sub('', title).strip()
+    return t if t else title
+
+def _string_similarity(a, b):
+    if a == b:
+        return 1.0
+    a_clean = NON_WORD_CHAR_REGEX.sub('', a).strip()
+    b_clean = NON_WORD_CHAR_REGEX.sub('', b).strip()
+    if a_clean == b_clean:
+        return 1.0
+    if not a_clean or not b_clean:
+        return 0.0
+
+    if b_clean in a_clean or a_clean in b_clean:
+        min_len = min(len(a_clean), len(b_clean))
+        max_len = max(len(a_clean), len(b_clean))
+        return (min_len / max_len) * 0.95
+
+    a_words = set(w for w in WHITESPACE_REGEX.split(a_clean) if len(w) > 1)
+    b_words = set(w for w in WHITESPACE_REGEX.split(b_clean) if len(w) > 1)
+    if not a_words or not b_words:
+        return 0.0
+
+    intersection = len(a_words.intersection(b_words))
+    union = len(a_words.union(b_words))
+    jaccard = intersection / union if union > 0 else 0.0
+    overlap = intersection / min(len(a_words), len(b_words))
+    return jaccard * 0.5 + overlap * 0.5
+
+def _search_jiosaavn(query):
+    encoded = urllib.parse.quote(query)
+    url = f"https://arcmusic-api.vercel.app/api/search/songs?query={encoded}&page=1&limit=8"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("success") and isinstance(data.get("data"), dict):
+                return data["data"].get("results", [])
+    except Exception:
+        pass
+    return []
+
+def _parse_jiosaavn_song(s):
+    image_raw = s.get("image")
+    images = image_raw if isinstance(image_raw, list) else []
+    
+    artists_raw = s.get("artists", {}).get("primary", [])
+    artists = artists_raw if isinstance(artists_raw, list) else []
+    artist_names = [a.get("name") for a in artists if isinstance(a, dict) and a.get("name")]
+    
+    dl_raw = s.get("downloadUrl")
+    download_urls = dl_raw if isinstance(dl_raw, list) else []
+    best_download = ""
+    for dl in reversed(download_urls):
+        if isinstance(dl, dict) and dl.get("url"):
+            best_download = dl["url"]
+            break
+
+    def get_image_url(index):
+        if 0 <= index < len(images):
+            item = images[index]
+            if isinstance(item, dict) and item.get("url"):
+                return item["url"]
+        return ""
+
+    def clean_html(text):
+        if not text:
+            return ""
+        return (text
+                .replace("&quot;", '"')
+                .replace("&amp;", '&')
+                .replace("&lt;", '<')
+                .replace("&gt;", '>')
+                .replace("&#039;", "'"))
+
+    return {
+        "id": str(s.get("id", "")),
+        "name": clean_html(str(s.get("name", ""))),
+        "duration": int(s.get("duration", 0)),
+        "album": clean_html(s.get("album", {}).get("name", "") if s.get("album") else ""),
+        "artist": ", ".join(artist_names),
+        "imageSmall": get_image_url(0),
+        "image": get_image_url(1),
+        "imageLarge": get_image_url(2),
+        "downloadUrl": best_download,
+    }
+
+def _score_candidate(song, clean_name, target_secs, artists):
+    song_clean = _clean_title(song.get("name", "")).lower()
+    name_sim = _string_similarity(song_clean, clean_name.lower())
+    if name_sim < 0.38:
+        return -1.0
+
+    duration = int(song.get("duration", 0))
+    dur_diff = abs(duration - target_secs) if target_secs > 0 else 0.0
+    if dur_diff > 30 and name_sim < 0.82:
+        return -1.0
+
+    artist_names = song.get("artist", "").lower()
+    artist_bonus = 1.5 if any(a.lower().split(' ')[0] in artist_names for a in artists if a) else 0.0
+    dur_penalty = min(dur_diff * 0.08, 3.0) if target_secs > 0 else 0.0
+
+    return name_sim * 10 + artist_bonus - dur_penalty
+
+def _best_match(candidates, clean_name, target_secs, artists):
+    best = None
+    best_score = float("-inf")
+    for s in candidates:
+        parsed = _parse_jiosaavn_song(s)
+        score = _score_candidate(parsed, clean_name, target_secs, artists)
+        if score > best_score and score >= 0:
+            best_score = score
+            best = parsed
+    return best
+
+def _match_single_track(track):
+    target_secs = (track.get("duration_ms", 0) or 0) / 1000.0
+    name = track.get("name", "")
+    clean_name = _clean_title(name)
+    artists = track.get("artists", [])
+    primary_artist = artists[0] if artists else ""
+
+    primary_query = f"{name} {primary_artist}".strip()
+    candidates = []
+
+    try:
+        initial_results = _search_jiosaavn(primary_query)
+        best_initial = _best_match(initial_results, clean_name, target_secs, artists)
+        if best_initial:
+            sim = _string_similarity(_clean_title(best_initial.get("name", "")).lower(), clean_name.lower())
+            dur_diff = abs(best_initial.get("duration", 0) - target_secs) if target_secs > 0 else 0.0
+            if sim >= 0.85 and dur_diff <= 10:
+                return {"spotify": track, "matched_song": best_initial}
+        candidates.extend(initial_results)
+    except Exception:
+        pass
+
+    fallback_queries = {
+        f"{clean_name} {primary_artist}".strip(),
+        clean_name,
+        name
+    }
+    fallback_queries = [q for q in fallback_queries if q and q != primary_query]
+
+    if fallback_queries:
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                results_lists = list(executor.map(_search_jiosaavn, fallback_queries))
+            for results in results_lists:
+                for s in results:
+                    if not any(c.get("id") == str(s.get("id")) for c in candidates):
+                        candidates.append(s)
+        except Exception:
+            pass
+
+    best = _best_match(candidates, clean_name, target_secs, artists)
+    return {"spotify": track, "matched_song": best}
+
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -28,6 +202,7 @@ class handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         raw_url = params.get("url", [None])[0]
+        match = params.get("match", ["false"])[0].lower() == "true"
 
         if not raw_url:
             self._json_response(400, {"error": "Missing 'url' parameter"})
@@ -109,6 +284,10 @@ class handler(BaseHTTPRequestHandler):
             if not tracks:
                 self._json_response(404, {"error": "Could not fetch playlist tracks"})
                 return
+
+            if match:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    tracks = list(executor.map(_match_single_track, tracks))
 
             self._json_response(200, {
                 "name": playlist_name,
